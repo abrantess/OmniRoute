@@ -202,15 +202,17 @@ export async function getSettings() {
     oidcRedirectPath: "/api/auth/oidc/callback",
     oidcAllowedSubjects: [], // optional sub or email whitelist
     oidcAdmissionClaim: null, // optional ID-token role/group admission policy
-    googleAuthEnabled: false,
+    // Social login kill-switches: a provider runs only with credentials and a non-empty
+    // allowlist; `false` turns it off even then.
+    googleAuthEnabled: true,
     googleClientId: "",
     googleClientSecret: "",
     googleRedirectPath: "/api/auth/google/callback",
-    githubAuthEnabled: false,
+    githubAuthEnabled: true,
     githubClientId: "",
     githubClientSecret: "",
     githubRedirectPath: "/api/auth/github/callback",
-    authAllowedEmails: [], // optional list of allowed email addresses
+    authAllowedEmails: [], // social login allowlist — empty admits nobody (deny-by-default)
     disablePasswordLogin: false,
     mcpEnabled: false,
     a2aEnabled: false,

@@ -2,14 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   isEmailAllowed,
-  isGithubLoginAllowed,
+  isGithubAccountAllowed,
   getGoogleOAuthConfig,
   getGitHubOAuthConfig,
   getRequestOrigin,
+  hasSocialLoginAccessChange,
   timingSafeCompare,
-  createDashboardSessionJwt,
 } from "../../src/lib/auth/socialOAuth.ts";
-import { verifyDashboardSessionToken } from "../../src/shared/utils/dashboardSessionToken.ts";
+import { updateSettingsSchema } from "../../src/shared/validation/settingsSchemas.ts";
 
 test("timingSafeCompare properly checks string equality in constant time", () => {
   assert.equal(timingSafeCompare("abcdef123", "abcdef123"), true);
@@ -47,12 +47,17 @@ test("isEmailAllowed validates emails against configured allowlists", () => {
   assert.equal(isEmailAllowed("test@example.com", csvAllowed), true);
   assert.equal(isEmailAllowed("other@example.com", csvAllowed), false);
 
-  // Wildcard domain matching: *@domain.com or @domain.com
+  // Wildcard domain matching: *@domain.com or @domain.com — only with the provider's proof that
+  // the account belongs to that domain (Google `hd`, GitHub primary e-mail), see the test below.
   const domainAllowed = ["*@trusted.org", "@corp.local"];
-  assert.equal(isEmailAllowed("alice@trusted.org", domainAllowed), true);
-  assert.equal(isEmailAllowed("bob@trusted.org", domainAllowed), true);
-  assert.equal(isEmailAllowed("charlie@corp.local", domainAllowed), true);
-  assert.equal(isEmailAllowed("hacker@untrusted.org", domainAllowed), false);
+  const trusted = { verifiedDomain: "trusted.org" };
+  assert.equal(isEmailAllowed("alice@trusted.org", domainAllowed, trusted), true);
+  assert.equal(isEmailAllowed("bob@trusted.org", domainAllowed, trusted), true);
+  assert.equal(
+    isEmailAllowed("charlie@corp.local", domainAllowed, { verifiedDomain: "corp.local" }),
+    true
+  );
+  assert.equal(isEmailAllowed("hacker@untrusted.org", domainAllowed, trusted), false);
 
   // Invalid inputs
   assert.equal(isEmailAllowed("", allowedList), false);
@@ -127,21 +132,68 @@ test("getRequestOrigin honours forwarded proto and Host, never X-Forwarded-Host"
   assert.equal(getRequestOrigin(localReq), "http://localhost:20128");
 });
 
-test("createDashboardSessionJwt mints a valid session token that passes verifyDashboardSessionToken", async () => {
-  const testSecret = new TextEncoder().encode("super-secure-test-jwt-secret-at-least-32-chars");
-  const jwt = await createDashboardSessionJwt(testSecret);
+test("domain entries need the provider's domain proof; a verified e-mail alone is not enough", () => {
+  const list = ["@corp.com", "*@trusted.org"];
+  // Consumer account that verified a corporate address (no Workspace `hd`, or not primary).
+  assert.equal(isEmailAllowed("ex-employee@corp.com", list), false);
+  assert.equal(isEmailAllowed("ex-employee@corp.com", list, { verifiedDomain: null }), false);
+  // Proof for a different domain does not count.
+  assert.equal(isEmailAllowed("a@corp.com", list, { verifiedDomain: "other.com" }), false);
+  assert.equal(isEmailAllowed("a@corp.com", list, { verifiedDomain: "CORP.com" }), true);
+  // Exact e-mail entries need no domain proof.
+  assert.equal(isEmailAllowed("ops@corp.com", ["ops@corp.com"]), true);
+});
 
-  assert.ok(jwt && typeof jwt === "string", "JWT must be a non-empty string");
+test("domain entries for public mail providers never match and the schema refuses them", () => {
+  for (const entry of ["@gmail.com", "*@outlook.com", "@GitHub.com"]) {
+    const domain = entry.replace(/^\*?@/, "").toLowerCase();
+    assert.equal(
+      isEmailAllowed(`anyone@${domain}`, [entry], { verifiedDomain: domain }),
+      false,
+      entry
+    );
+    assert.equal(
+      updateSettingsSchema.safeParse({ authAllowedEmails: [entry] }).success,
+      false,
+      `${entry} must be refused by the settings schema`
+    );
+  }
+  // An exact address at a public provider is fine.
+  assert.equal(isEmailAllowed("me@gmail.com", ["me@gmail.com"]), true);
+  assert.equal(
+    updateSettingsSchema.safeParse({ authAllowedEmails: ["me@gmail.com"] }).success,
+    true
+  );
+});
 
-  // Verifier requires matching secret and authenticated: true claim
-  const payload = await verifyDashboardSessionToken(jwt, testSecret);
-  assert.ok(payload !== null, "Session token must verify successfully");
-  assert.equal(payload.authenticated, true, "Payload must carry authenticated: true");
+test("providerAuthEnabled: false is a kill-switch even with credentials and an allowlist", () => {
+  const configured = {
+    authAllowedEmails: ["admin@company.com"],
+    googleClientId: "g-id",
+    googleClientSecret: "g-secret",
+    githubClientId: "gh-id",
+    githubClientSecret: "gh-secret",
+  };
+  assert.equal(getGoogleOAuthConfig(configured).enabled, true);
+  assert.equal(getGitHubOAuthConfig(configured).enabled, true);
+  assert.equal(getGoogleOAuthConfig({ ...configured, googleAuthEnabled: false }).enabled, false);
+  assert.equal(getGitHubOAuthConfig({ ...configured, githubAuthEnabled: false }).enabled, false);
+  assert.equal(getGoogleOAuthConfig({ ...configured, googleAuthEnabled: true }).enabled, true);
+});
 
-  // Wrong secret must reject
-  const wrongSecret = new TextEncoder().encode("wrong-secret-key-32-characters-long!!");
-  const invalidPayload = await verifyDashboardSessionToken(jwt, wrongSecret);
-  assert.equal(invalidPayload, null, "Wrong secret must fail verification");
+test("hasSocialLoginAccessChange flags allowlist, credential and toggle changes only", () => {
+  const current = {
+    authAllowedEmails: ["a@corp.com"],
+    googleClientSecret: "s1",
+    githubAuthEnabled: true,
+    theme: "light",
+  };
+  assert.equal(hasSocialLoginAccessChange({ authAllowedEmails: ["b@corp.com"] }, current), true);
+  assert.equal(hasSocialLoginAccessChange({ googleClientSecret: "s2" }, current), true);
+  assert.equal(hasSocialLoginAccessChange({ githubAuthEnabled: false }, current), true);
+  assert.equal(hasSocialLoginAccessChange({ authAllowedEmails: ["a@corp.com"] }, current), false);
+  assert.equal(hasSocialLoginAccessChange({ theme: "dark" }, current), false);
+  assert.equal(hasSocialLoginAccessChange({ googleRedirectPath: "/x" }, current), false);
 });
 
 test("provider is disabled until an allowlist is configured (#15153)", () => {
@@ -200,17 +252,25 @@ test("generic GOOGLE_CLIENT_ID / GITHUB_CLIENT_ID env vars are NOT used as login
   }
 });
 
-test("isGithubLoginAllowed only matches bare username entries, never email/domain entries", () => {
-  const list = ["octocat", "@corp.local", "*@trusted.org", "admin@company.com"];
-  assert.equal(isGithubLoginAllowed("octocat", list), true);
-  assert.equal(isGithubLoginAllowed("OctoCat", list), true);
-  assert.equal(isGithubLoginAllowed("corp.local", list), false);
-  assert.equal(isGithubLoginAllowed("trusted.org", list), false);
-  assert.equal(isGithubLoginAllowed("admin", list), false);
-  assert.equal(isGithubLoginAllowed("someone-else", list), false);
-  assert.equal(isGithubLoginAllowed("", list), false);
-  assert.equal(isGithubLoginAllowed("octocat", []), false);
-  assert.equal(isGithubLoginAllowed("octocat", ["*"]), false);
+test("isGithubAccountAllowed matches github:<id> and bare usernames, never email/domain entries", () => {
+  const list = ["octocat", "github:583231", "@corp.local", "*@trusted.org", "admin@company.com"];
+  assert.equal(isGithubAccountAllowed({ login: "octocat" }, list), true);
+  assert.equal(isGithubAccountAllowed({ login: "OctoCat" }, list), true);
+  assert.equal(isGithubAccountAllowed({ login: "corp.local" }, list), false);
+  assert.equal(isGithubAccountAllowed({ login: "trusted.org" }, list), false);
+  assert.equal(isGithubAccountAllowed({ login: "admin" }, list), false);
+  assert.equal(isGithubAccountAllowed({ login: "someone-else" }, list), false);
+  assert.equal(isGithubAccountAllowed({ login: "" }, list), false);
+  assert.equal(isGithubAccountAllowed({ login: "octocat" }, []), false);
+  assert.equal(isGithubAccountAllowed({ login: "octocat" }, ["*"]), false);
+
+  // The stable numeric id survives a rename; a re-registered login does not inherit it.
+  assert.equal(isGithubAccountAllowed({ login: "renamed", id: 583231 }, list), true);
+  assert.equal(isGithubAccountAllowed({ login: "squatter", id: 999 }, ["github:583231"]), false);
+  assert.equal(isGithubAccountAllowed({ login: "github:583231" }, ["github:583231"]), false);
+  assert.equal(isGithubAccountAllowed({ login: "x", id: null }, ["github:583231"]), false);
+  // A `github:` entry never matches as a username either.
+  assert.equal(isGithubAccountAllowed({ login: "github" }, ["github:583231"]), false);
 });
 
 test("redirect path from settings must be a same-origin absolute path (no open redirect_uri)", () => {

@@ -1,5 +1,8 @@
-import { SignJWT } from "jose";
-import { DASHBOARD_SESSION_CLAIM } from "@/shared/utils/dashboardSessionToken";
+import { SOCIAL_LOGIN_SESSION_ENDING_SETTINGS_KEYS } from "@/shared/constants/securityImpactingSettings";
+import {
+  PUBLIC_EMAIL_DOMAINS,
+  domainOfAllowlistEntry,
+} from "@/shared/constants/publicEmailDomains";
 import { timingSafeCompare } from "@/shared/utils/timingSafeCompare";
 
 export interface GoogleOAuthConfig {
@@ -80,6 +83,21 @@ export function resolveAuthAllowlist(allowedConfig?: unknown): string[] {
 }
 
 /**
+ * A provider is on only with credentials AND a non-empty allowlist, and `<provider>AuthEnabled:
+ * false` is a kill-switch that turns it off even then (the default is `true`, so an env-only setup
+ * works; switching it off is an explicit operator action).
+ */
+function isProviderEnabled(
+  toggle: unknown,
+  clientId: string,
+  clientSecret: string,
+  allowedConfig: unknown
+): boolean {
+  if (toggle === false) return false;
+  return Boolean(clientId && clientSecret) && resolveAuthAllowlist(allowedConfig).length > 0;
+}
+
+/**
  * Resolves Google OAuth 2.0 configuration from settings with environment variable fallbacks.
  * Only the dedicated `AUTH_GOOGLE_*` variables are read (the generic `GOOGLE_CLIENT_ID` is commonly
  * present for unrelated reasons). The provider stays disabled until an allowlist is configured.
@@ -97,9 +115,12 @@ export function getGoogleOAuthConfig(settings: Record<string, unknown>): GoogleO
     settings.googleRedirectPath,
     "/api/auth/google/callback"
   );
-  const enabled =
-    Boolean(clientId && clientSecret) &&
-    resolveAuthAllowlist(settings.authAllowedEmails).length > 0;
+  const enabled = isProviderEnabled(
+    settings.googleAuthEnabled,
+    clientId,
+    clientSecret,
+    settings.authAllowedEmails
+  );
 
   return { enabled, clientId, clientSecret, redirectPath };
 }
@@ -121,54 +142,94 @@ export function getGitHubOAuthConfig(settings: Record<string, unknown>): GitHubO
     settings.githubRedirectPath,
     "/api/auth/github/callback"
   );
-  const enabled =
-    Boolean(clientId && clientSecret) &&
-    resolveAuthAllowlist(settings.authAllowedEmails).length > 0;
+  const enabled = isProviderEnabled(
+    settings.githubAuthEnabled,
+    clientId,
+    clientSecret,
+    settings.authAllowedEmails
+  );
 
   return { enabled, clientId, clientSecret, redirectPath };
 }
 
 /**
- * Validates whether an email address is authorized against the allowlist. Deny-by-default: an
- * empty allowlist (or a bare "*") admits nobody. Supports exact email matches and wildcard domain
- * matches (e.g. "*@example.com" or "@example.com").
+ * What the provider proves about the account's domain. A verified e-mail alone does not prove a
+ * CURRENT tie to its domain (a consumer Google account created with `x@corp.com`, or a GitHub
+ * account that once verified a corporate address, keep it after the person leaves), so domain
+ * entries need this extra proof:
+ *   - Google: the Workspace `hd` claim;
+ *   - GitHub: the address is the account's PRIMARY verified e-mail.
  */
-export function isEmailAllowed(email: string | null | undefined, allowedConfig?: unknown): boolean {
-  if (!email || typeof email !== "string") return false;
-  const normalizedEmail = email.trim().toLowerCase();
-
-  for (const allowed of resolveAuthAllowlist(allowedConfig)) {
-    const normAllowed = allowed.toLowerCase();
-    if (normAllowed === normalizedEmail) {
-      return true;
-    }
-    // Handle wildcard domain: *@domain.com or @domain.com
-    if (normAllowed.startsWith("*@") && normalizedEmail.endsWith(normAllowed.slice(1))) {
-      return true;
-    }
-    if (normAllowed.startsWith("@") && normalizedEmail.endsWith(normAllowed)) {
-      return true;
-    }
-  }
-
-  return false;
+export interface EmailDomainProof {
+  /** Lower-cased domain the provider vouches for, or null/undefined when there is none. */
+  verifiedDomain?: string | null;
 }
 
 /**
- * Validates a GitHub login against the allowlist. Only bare username entries (no "@", no "*")
- * match, so a username can never satisfy an e-mail or domain entry (and vice versa).
+ * Validates whether an email address is authorized against the allowlist. Deny-by-default: an
+ * empty allowlist (or a bare "*") admits nobody. Exact e-mail entries match a verified e-mail;
+ * domain entries ("*@example.com" / "@example.com") also need `proof.verifiedDomain` to equal that
+ * domain, and entries for public mail providers never match.
  */
-export function isGithubLoginAllowed(
-  login: string | null | undefined,
+export function isEmailAllowed(
+  email: string | null | undefined,
+  allowedConfig?: unknown,
+  proof: EmailDomainProof = {}
+): boolean {
+  if (!email || typeof email !== "string") return false;
+  const normalizedEmail = email.trim().toLowerCase();
+  const provenDomain = proof.verifiedDomain ? proof.verifiedDomain.trim().toLowerCase() : null;
+
+  return resolveAuthAllowlist(allowedConfig).some((allowed) => {
+    const normAllowed = allowed.toLowerCase();
+    if (normAllowed === normalizedEmail) return true;
+    const domain = domainOfAllowlistEntry(normAllowed);
+    if (!domain || PUBLIC_EMAIL_DOMAINS.has(domain)) return false;
+    return normalizedEmail.endsWith(`@${domain}`) && provenDomain === domain;
+  });
+}
+
+/** Prefix of an allowlist entry that names a GitHub account by its stable numeric id. */
+const GITHUB_ID_ENTRY_PREFIX = "github:";
+
+/**
+ * Validates a GitHub account against the allowlist:
+ *   - `github:<id>` entries match the account's stable numeric id (preferred);
+ *   - bare username entries (no "@", "*" or ":") match the login. A GitHub username can be renamed
+ *     and later re-registered by someone else, so these are discouraged — use `github:<id>`.
+ * Neither ever satisfies an e-mail or domain entry (and vice versa).
+ */
+export function isGithubAccountAllowed(
+  account: { login?: string | null; id?: number | string | null },
   allowedConfig?: unknown
 ): boolean {
-  if (!login || typeof login !== "string") return false;
-  const normalizedLogin = login.trim().toLowerCase();
-  if (!normalizedLogin) return false;
+  const normalizedLogin =
+    typeof account.login === "string" ? account.login.trim().toLowerCase() : "";
+  const id =
+    typeof account.id === "number" || typeof account.id === "string"
+      ? String(account.id).trim()
+      : "";
 
-  return resolveAuthAllowlist(allowedConfig).some(
-    (allowed) =>
-      !allowed.includes("@") && !allowed.includes("*") && allowed.toLowerCase() === normalizedLogin
+  return resolveAuthAllowlist(allowedConfig).some((allowed) => {
+    const normAllowed = allowed.toLowerCase();
+    if (normAllowed.startsWith(GITHUB_ID_ENTRY_PREFIX)) {
+      return /^\d+$/.test(id) && normAllowed.slice(GITHUB_ID_ENTRY_PREFIX.length) === id;
+    }
+    if (/[@*:]/.test(normAllowed)) return false;
+    return normalizedLogin.length > 0 && normAllowed === normalizedLogin;
+  });
+}
+
+/**
+ * True when a settings patch changes who may sign in with Google/GitHub (allowlist, a client
+ * id/secret, a provider toggle). The settings route then ends every older dashboard session.
+ */
+export function hasSocialLoginAccessChange(
+  patch: Record<string, unknown>,
+  current: Record<string, unknown>
+): boolean {
+  return SOCIAL_LOGIN_SESSION_ENDING_SETTINGS_KEYS.some(
+    (key) => key in patch && JSON.stringify(patch[key]) !== JSON.stringify(current[key])
   );
 }
 
@@ -177,16 +238,6 @@ export function isGithubLoginAllowed(
  */
 export function generateOAuthState(): string {
   return crypto.randomUUID();
-}
-
-/**
- * Creates the standard 30-day dashboard session JWT.
- */
-export async function createDashboardSessionJwt(secret: Uint8Array): Promise<string> {
-  return new SignJWT({ [DASHBOARD_SESSION_CLAIM]: true })
-    .setProtectedHeader({ alg: "HS256" })
-    .setExpirationTime("30d")
-    .sign(secret);
 }
 
 export { timingSafeCompare };

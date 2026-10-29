@@ -8,6 +8,7 @@
 import { z } from "zod";
 import { oidcAdmissionClaimSchema } from "@/shared/utils/oidcAdmissionClaim";
 import { CONNECTION_TEST_PROMPT_MAX_LENGTH } from "@/shared/constants/connectionTest";
+import { isPublicEmailDomainEntry } from "@/shared/constants/publicEmailDomains";
 import { COMBO_CONFIG_MODES } from "@/shared/constants/comboConfigMode";
 import { MAX_REQUEST_BODY_LIMIT_MB, MIN_REQUEST_BODY_LIMIT_MB } from "@/shared/constants/bodySize";
 import {
@@ -147,7 +148,14 @@ export const updateSettingsSchema = z.object({
   githubClientId: z.string().max(200).optional(),
   githubClientSecret: z.string().max(500).optional(),
   githubRedirectPath: socialRedirectPathSchema.optional(),
-  authAllowedEmails: z.array(z.string().max(200)).max(500).optional(),
+  authAllowedEmails: z
+    .array(z.string().max(200))
+    .max(500)
+    .refine((entries) => !entries.some(isPublicEmailDomainEntry), {
+      message:
+        "domain entries for public mail providers (e.g. @gmail.com) would admit every account; list exact e-mails instead",
+    })
+    .optional(),
   disablePasswordLogin: z.boolean().optional(),
   enableSocks5Proxy: z.boolean().optional(),
   instanceName: z.string().max(100).optional(),

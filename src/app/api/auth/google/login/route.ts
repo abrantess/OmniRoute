@@ -1,4 +1,3 @@
-import { NextResponse } from "next/server";
 import { getCachedSettings } from "@/lib/db/readCache";
 import { cookies } from "next/headers";
 import { errorResponse } from "@omniroute/open-sse/utils/error";
@@ -8,6 +7,7 @@ import {
   getRequestOrigin,
   isRequestSecure,
 } from "@/lib/auth/socialOAuth";
+import { redirectToProvider } from "@/lib/auth/socialLogin";
 
 export const googleLoginInternals = {
   getCookieStore: cookies,
@@ -38,19 +38,7 @@ export async function GET(request: Request) {
   authUrl.searchParams.set("client_id", config.clientId);
   authUrl.searchParams.set("redirect_uri", redirectUri);
   authUrl.searchParams.set("scope", "openid email profile");
-  authUrl.searchParams.set("state", state);
   authUrl.searchParams.set("prompt", "select_account");
 
-  const useSecureCookie = isRequestSecure(request);
-
-  const res = NextResponse.redirect(authUrl.toString());
-  res.cookies.set("google_oauth_state", state, {
-    httpOnly: true,
-    sameSite: "lax",
-    path: "/",
-    maxAge: 60 * 10,
-    secure: useSecureCookie,
-  });
-
-  return res;
+  return redirectToProvider(authUrl, "google", state, isRequestSecure(request));
 }

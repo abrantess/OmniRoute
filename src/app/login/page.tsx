@@ -17,6 +17,15 @@ import { AlertDescription, AlertTitle } from "@omniroute/ui-kit/alert";
 import { useRouter } from "next/navigation";
 import { withBasePath } from "@/shared/utils/basePath";
 
+/** `/login?error=<code>` codes of the OAuth/OIDC callbacks → `auth` message keys. */
+const OAUTH_ERROR_MESSAGE_KEYS: Record<string, string> = {
+  unauthorized_email: "oauthEmailNotAllowed",
+  subject_not_allowed: "oauthEmailNotAllowed",
+  email_not_verified: "oauthEmailNotVerified",
+  invalid_state: "oauthStateInvalid",
+  not_configured: "oauthNotConfigured",
+};
+
 export default function LoginPage() {
   const t = useTranslations("auth");
   const [password, setPassword] = useState("");
@@ -40,19 +49,9 @@ export default function LoginPage() {
     if (!err) return;
     // Deferred like `setMounted` below: reading the query string needs the browser, and a
     // synchronous setState inside the effect trips react-hooks/set-state-in-effect.
-    const raf = requestAnimationFrame(() => {
-      if (err === "unauthorized_email" || err === "subject_not_allowed") {
-        setError(t("oauthEmailNotAllowed"));
-      } else if (err === "email_not_verified") {
-        setError(t("oauthEmailNotVerified"));
-      } else if (err === "invalid_state") {
-        setError(t("oauthStateInvalid"));
-      } else if (err === "not_configured") {
-        setError(t("oauthNotConfigured"));
-      } else {
-        setError(t("oauthLoginFailed"));
-      }
-    });
+    const raf = requestAnimationFrame(() =>
+      setError(t(OAUTH_ERROR_MESSAGE_KEYS[err] ?? "oauthLoginFailed"))
+    );
     return () => cancelAnimationFrame(raf);
   }, [t]);
 
@@ -296,6 +295,7 @@ export default function LoginPage() {
                 primary={passwordLoginHidden}
                 googleLabel={t("continueWithGoogle")}
                 githubLabel={t("continueWithGitHub")}
+                orLabel={t("or")}
               />
 
               {passwordLoginHidden ? (
@@ -320,17 +320,6 @@ export default function LoginPage() {
                 </div>
               ) : (
                 <>
-                  {(googleAuthEnabled || githubAuthEnabled) && (
-                    <div className="relative my-6">
-                      <div className="absolute inset-0 flex items-center">
-                        <div className="w-full border-t border-border" />
-                      </div>
-                      <div className="relative flex justify-center text-xs uppercase">
-                        <span className="bg-surface px-2 text-text-muted">{t("or")}</span>
-                      </div>
-                    </div>
-                  )}
-
                   <form onSubmit={handleLogin} className="space-y-5 w-full">
                     <Input
                       type="password"
@@ -461,19 +450,24 @@ const GITHUB_ICON_PATH =
 const SOCIAL_BUTTON_CLASS =
   "w-full h-11 text-sm font-medium flex items-center justify-center gap-2 border border-border bg-surface hover:bg-surface-hover text-text-main transition-colors";
 
-/** Google / GitHub sign-in buttons; renders nothing when neither provider is enabled. */
+/**
+ * Google / GitHub sign-in buttons; renders nothing when neither provider is enabled. When they are
+ * secondary to the password form, an "or" divider separates them from it.
+ */
 function SocialLoginButtons({
   googleEnabled,
   githubEnabled,
   primary,
   googleLabel,
   githubLabel,
+  orLabel,
 }: {
   googleEnabled: boolean;
   githubEnabled: boolean;
   primary: boolean;
   googleLabel: string;
   githubLabel: string;
+  orLabel: string;
 }) {
   if (!googleEnabled && !githubEnabled) return null;
   const variant = primary ? "primary" : "secondary";
@@ -506,6 +500,16 @@ function SocialLoginButtons({
           </svg>
           <span>{githubLabel}</span>
         </Button>
+      )}
+      {!primary && (
+        <div className="relative pt-3">
+          <div className="absolute inset-0 top-3 flex items-center">
+            <div className="w-full border-t border-border" />
+          </div>
+          <div className="relative flex justify-center text-xs uppercase">
+            <span className="bg-surface px-2 text-text-muted">{orLabel}</span>
+          </div>
+        </div>
       )}
     </div>
   );

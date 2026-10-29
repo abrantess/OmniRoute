@@ -10,7 +10,7 @@ import {
 } from "@/lib/auth/socialOAuth";
 import {
   asRecord,
-  consumeOAuthState,
+  consumeOAuthFlow,
   getJsonWithBearer,
   postForJson,
   startDashboardSession,
@@ -25,7 +25,8 @@ export const googleCallbackInternals = {
 async function exchangeCodeForAccessToken(
   config: ReturnType<typeof getGoogleOAuthConfig>,
   code: string,
-  redirectUri: string
+  redirectUri: string,
+  codeVerifier: string
 ): Promise<StepResult<string>> {
   const token = await postForJson(
     "https://oauth2.googleapis.com/token",
@@ -37,25 +38,33 @@ async function exchangeCodeForAccessToken(
         redirect_uri: redirectUri,
         client_id: config.clientId,
         client_secret: config.clientSecret,
+        code_verifier: codeVerifier,
       }).toString(),
     },
     { request: "token_exchange", response: "token_response" }
   );
-  if (!token.ok) return token;
+  if (token.ok === false) return token;
   const accessToken = token.value.access_token;
   return typeof accessToken === "string" && accessToken
     ? { ok: true, value: accessToken }
     : { ok: false, error: "token_response" };
 }
 
-/** Returns the lower-cased e-mail only when Google reports it as verified. */
-async function fetchVerifiedEmail(accessToken: string): Promise<StepResult<string>> {
+/** A Google account's verified e-mail and its Workspace domain (`hd`), when it has one. */
+interface GoogleIdentity {
+  email: string;
+  hostedDomain: string | null;
+}
+
+/** Returns the lower-cased e-mail only when Google reports it as verified, plus the `hd` claim. */
+async function fetchVerifiedIdentity(accessToken: string): Promise<StepResult<GoogleIdentity>> {
   const raw = await getJsonWithBearer("https://www.googleapis.com/oauth2/v3/userinfo", accessToken);
   if (raw === null) return { ok: false, error: "user_info_failed" };
   const info = asRecord(raw);
   const email = typeof info.email === "string" ? info.email.trim().toLowerCase() : "";
   if (!email || info.email_verified !== true) return { ok: false, error: "email_not_verified" };
-  return { ok: true, value: email };
+  const hostedDomain = typeof info.hd === "string" && info.hd ? info.hd.trim().toLowerCase() : null;
+  return { ok: true, value: { email, hostedDomain } };
 }
 
 /**
@@ -72,9 +81,8 @@ export async function GET(request: Request) {
   if (!code || !returnedState) return fail("missing_code");
 
   const cookieStore = await googleCallbackInternals.getCookieStore();
-  if (!consumeOAuthState(cookieStore, "google_oauth_state", returnedState)) {
-    return fail("invalid_state");
-  }
+  const codeVerifier = consumeOAuthFlow(cookieStore, "google", returnedState);
+  if (!codeVerifier) return fail("invalid_state");
 
   const settings = await getCachedSettings();
   const config = getGoogleOAuthConfig(settings);
@@ -83,16 +91,19 @@ export async function GET(request: Request) {
   const accessToken = await exchangeCodeForAccessToken(
     config,
     code,
-    `${origin}${config.redirectPath}`
+    `${origin}${config.redirectPath}`,
+    codeVerifier
   );
-  if (!accessToken.ok) return fail(accessToken.error);
+  if (accessToken.ok === false) return fail(accessToken.error);
 
-  const verified = await fetchVerifiedEmail(accessToken.value);
-  if (!verified.ok) return fail(verified.error);
-  const email = verified.value;
+  const verified = await fetchVerifiedIdentity(accessToken.value);
+  if (verified.ok === false) return fail(verified.error);
+  const { email, hostedDomain } = verified.value;
 
   const auditContext = getAuditRequestContext(request);
-  if (!isEmailAllowed(email, settings.authAllowedEmails)) {
+  // Domain entries need the Workspace `hd` claim: a consumer account that merely verified a
+  // corporate address does not prove a current tie to that domain.
+  if (!isEmailAllowed(email, settings.authAllowedEmails, { verifiedDomain: hostedDomain })) {
     logAuditEvent({
       action: "auth.login.google.unauthorized",
       actor: email,

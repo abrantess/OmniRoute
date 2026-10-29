@@ -1,6 +1,16 @@
+import { NextResponse } from "next/server";
 import { updateSettings } from "@/lib/db/settings";
-import { getDashboardJwtSecret } from "@/shared/utils/dashboardSessionToken";
-import { createDashboardSessionJwt, timingSafeCompare } from "@/lib/auth/socialOAuth";
+import {
+  DASHBOARD_SESSION_COOKIE,
+  getDashboardJwtSecret,
+  mintDashboardSessionToken,
+} from "@/shared/utils/dashboardSessionToken";
+import { timingSafeCompare } from "@/lib/auth/socialOAuth";
+import {
+  PKCE_CHALLENGE_METHOD,
+  generateCodeChallenge,
+  generateCodeVerifier,
+} from "@/lib/oauth/utils/pkce";
 
 /** Minimal cookie-store surface the social login handlers need (`next/headers` or a test seam). */
 export interface SocialCookieStore {
@@ -15,19 +25,66 @@ export function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
 
+export type SocialProvider = "google" | "github";
+
+/** Cookie names of the per-browser flow material for one provider (`state` + PKCE verifier). */
+export function oauthFlowCookieNames(provider: SocialProvider) {
+  return { state: `${provider}_oauth_state`, verifier: `${provider}_oauth_pkce_verifier` };
+}
+
+/**
+ * Redirects the browser to the provider's authorization URL with the per-browser flow material:
+ * the `state` (login CSRF) and a PKCE S256 challenge whose verifier stays in this browser, so an
+ * authorization code stolen in transit cannot be redeemed from another browser (RFC 9700 asks for
+ * PKCE on confidential clients too). Both values live in short-lived httpOnly cookies.
+ */
+export function redirectToProvider(
+  authUrl: URL,
+  provider: SocialProvider,
+  state: string,
+  secure: boolean
+): NextResponse {
+  const verifier = generateCodeVerifier();
+  authUrl.searchParams.set("state", state);
+  authUrl.searchParams.set("code_challenge", generateCodeChallenge(verifier));
+  authUrl.searchParams.set("code_challenge_method", PKCE_CHALLENGE_METHOD);
+
+  const res = NextResponse.redirect(authUrl.toString());
+  const names = oauthFlowCookieNames(provider);
+  for (const [name, value] of [
+    [names.state, state],
+    [names.verifier, verifier],
+  ]) {
+    res.cookies.set(name, value, {
+      httpOnly: true,
+      sameSite: "lax",
+      path: "/",
+      maxAge: 60 * 10,
+      secure,
+    });
+  }
+  return res;
+}
+
 /**
  * Checks the returned OAuth `state` against the per-browser cookie set by the login route and
- * clears the cookie once it matches (single use).
+ * returns the PKCE verifier started with it. Both cookies are single use: they are cleared once
+ * the state matches. Returns null (flow rejected) when the state does not match or the verifier
+ * is missing — a callback this browser did not start is never redeemed.
  */
-export function consumeOAuthState(
+export function consumeOAuthFlow(
   cookieStore: SocialCookieStore,
-  cookieName: string,
+  provider: SocialProvider,
   returnedState: string
-): boolean {
-  const storedState = cookieStore.get(cookieName)?.value;
-  if (!storedState || !timingSafeCompare(storedState, returnedState)) return false;
-  cookieStore.set(cookieName, "", { httpOnly: true, sameSite: "lax", path: "/", maxAge: 0 });
-  return true;
+): string | null {
+  const names = oauthFlowCookieNames(provider);
+  const storedState = cookieStore.get(names.state)?.value;
+  if (!storedState || !timingSafeCompare(storedState, returnedState)) return null;
+  const verifier = cookieStore.get(names.verifier)?.value || "";
+  for (const name of [names.state, names.verifier]) {
+    cookieStore.set(name, "", { httpOnly: true, sameSite: "lax", path: "/", maxAge: 0 });
+  }
+  return verifier || null;
 }
 
 /**
@@ -76,8 +133,9 @@ export async function getJsonWithBearer(
 }
 
 /**
- * Completes a successful social login: marks setup complete, mints the standard 30-day dashboard
- * session JWT and sets the `auth_token` cookie. Returns false when no JWT secret is available.
+ * Completes a successful social login: marks setup complete, mints the dashboard session through
+ * the canonical minter (with `iat` + `jti`, so sign-out and a password change end it like any
+ * other session) and sets the `auth_token` cookie. Returns false when no JWT secret is available.
  */
 export async function startDashboardSession(
   cookieStore: SocialCookieStore,
@@ -92,7 +150,7 @@ export async function startDashboardSession(
   const secret = getDashboardJwtSecret();
   if (!secret) return false;
 
-  cookieStore.set("auth_token", await createDashboardSessionJwt(secret), {
+  cookieStore.set(DASHBOARD_SESSION_COOKIE, await mintDashboardSessionToken(secret), {
     httpOnly: true,
     secure,
     sameSite: "lax",

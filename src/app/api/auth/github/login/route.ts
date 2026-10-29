@@ -1,4 +1,3 @@
-import { NextResponse } from "next/server";
 import { getCachedSettings } from "@/lib/db/readCache";
 import { cookies } from "next/headers";
 import { errorResponse } from "@omniroute/open-sse/utils/error";
@@ -8,6 +7,7 @@ import {
   getRequestOrigin,
   isRequestSecure,
 } from "@/lib/auth/socialOAuth";
+import { redirectToProvider } from "@/lib/auth/socialLogin";
 
 export const githubLoginInternals = {
   getCookieStore: cookies,
@@ -37,18 +37,6 @@ export async function GET(request: Request) {
   authUrl.searchParams.set("client_id", config.clientId);
   authUrl.searchParams.set("redirect_uri", redirectUri);
   authUrl.searchParams.set("scope", "read:user user:email");
-  authUrl.searchParams.set("state", state);
 
-  const useSecureCookie = isRequestSecure(request);
-
-  const res = NextResponse.redirect(authUrl.toString());
-  res.cookies.set("github_oauth_state", state, {
-    httpOnly: true,
-    sameSite: "lax",
-    path: "/",
-    maxAge: 60 * 10,
-    secure: useSecureCookie,
-  });
-
-  return res;
+  return redirectToProvider(authUrl, "github", state, isRequestSecure(request));
 }
